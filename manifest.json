@@ -1,7 +1,7 @@
 {
   "id": "gedos-vault-bridge",
   "name": "GedOS Vault Bridge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "minAppVersion": "1.4.0",
   "description": "Connects mmxMatrix to this Obsidian vault: writes trade notes into a managed block and serves the vault graph and model/concept notes back to the site.",
   "author": "GedOS",
