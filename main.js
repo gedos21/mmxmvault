@@ -173,16 +173,22 @@ class GedOSVaultBridge extends Plugin {
   async onload() {
     this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
     if (!this.settings.token) { this.settings.token = nodeCrypto.randomBytes(32).toString('hex'); await this.saveData(this.settings); }
-    if (!String(this.settings.rootFolder || '').trim()) {
-      /* an install that already wrote notes under the old fixed folder keeps
-         using it; a fresh vault gets the neutral default */
-      const legacy = this.app.vault.getAbstractFileByPath(joinPath(LEGACY_ROOT, 'Trading Journal'));
-      this.settings.rootFolder = legacy ? LEGACY_ROOT : DEFAULT_ROOT;
-      await this.saveData(this.settings);
-    }
+    /* the vault index is not populated during onload, so asking it anything
+       here answers "nothing exists" — the detection has to wait for layout */
+    this.app.workspace.onLayoutReady(() => { this.resolveRootFolder().catch(() => {}); });
     this.addSettingTab(new GedOSSettingTab(this.app, this));
     this.startServer();
     this.addCommand({ id: 'show-connection-details', name: 'Show mmxMatrix connection details', callback: () => new Notice(`GedOS bridge: http://127.0.0.1:${this.settings.port} · token: ${this.settings.token}`) });
+  }
+
+  /* an install that already wrote notes under the old fixed folder keeps using
+     it; a fresh vault gets the neutral default. Runs once, after the vault
+     index is ready. */
+  async resolveRootFolder() {
+    if (String(this.settings.rootFolder || '').trim()) return;
+    const legacy = this.app.vault.getAbstractFileByPath(joinPath(LEGACY_ROOT, 'Trading Journal'));
+    this.settings.rootFolder = legacy ? LEGACY_ROOT : DEFAULT_ROOT;
+    await this.saveData(this.settings);
   }
 
   get root() { return String(this.settings.rootFolder || '').trim().replace(/^\/+|\/+$/g, '') || DEFAULT_ROOT; }
