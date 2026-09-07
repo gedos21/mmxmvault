@@ -2,7 +2,16 @@ const { Plugin, PluginSettingTab, Setting, Notice } = require('obsidian');
 const http = require('http');
 const nodeCrypto = require('crypto');
 
-const DEFAULT_SETTINGS = { port: 27125, token: '' };
+const DEFAULT_SETTINGS = { port: 27125, token: '', rootFolder: '' };
+/* where mmxMatrix keeps its notes inside the vault. Empty means "not chosen
+   yet" so an existing install can be detected on first load instead of
+   silently pointing somewhere new. */
+const DEFAULT_ROOT = 'mmxMatrix';
+const LEGACY_ROOT = 'GedOS';
+
+function joinPath(...parts) {
+  return parts.filter((part) => String(part || '').trim()).join('/');
+}
 
 function safePart(value, fallback) {
   return String(value || fallback).replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || fallback;
@@ -126,7 +135,7 @@ function noteAliases(cache) {
   return list.map((alias) => String(alias).trim()).filter(Boolean).slice(0, 8);
 }
 
-/* the deepest matching folder wins: GedOS/Models/Break and Retest.md -> model */
+/* the deepest matching folder wins: <root>/Models/Break and Retest.md -> model */
 function folderType(path) {
   const parts = String(path).split('/').slice(0, -1);
   for (let i = parts.length - 1; i >= 0; i -= 1) {
@@ -145,7 +154,7 @@ function tagType(tags) {
   return '';
 }
 
-function classifyNote(file, cache, tags) {
+function classifyNote(file, cache, tags, root = DEFAULT_ROOT) {
   /* an explicit `type:` in frontmatter is the author's own answer — trust it
      first. `type: hub` is deliberately not listed: hub notes say what they are
      through the folder they live in. */
@@ -156,7 +165,7 @@ function classifyNote(file, cache, tags) {
   const byTag = tagType(tags);
   if (byTag) return byTag;
   /* legacy trade notes written before frontmatter carried a type */
-  if (file.path.startsWith('GedOS/Trading Journal/')) return 'trade';
+  if (file.path.startsWith(`${joinPath(root, 'Trading Journal')}/`)) return 'trade';
   return 'journal';
 }
 
@@ -164,14 +173,33 @@ class GedOSVaultBridge extends Plugin {
   async onload() {
     this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
     if (!this.settings.token) { this.settings.token = nodeCrypto.randomBytes(32).toString('hex'); await this.saveData(this.settings); }
+    if (!String(this.settings.rootFolder || '').trim()) {
+      /* an install that already wrote notes under the old fixed folder keeps
+         using it; a fresh vault gets the neutral default */
+      const legacy = this.app.vault.getAbstractFileByPath(joinPath(LEGACY_ROOT, 'Trading Journal'));
+      this.settings.rootFolder = legacy ? LEGACY_ROOT : DEFAULT_ROOT;
+      await this.saveData(this.settings);
+    }
     this.addSettingTab(new GedOSSettingTab(this.app, this));
     this.startServer();
     this.addCommand({ id: 'show-connection-details', name: 'Show mmxMatrix connection details', callback: () => new Notice(`GedOS bridge: http://127.0.0.1:${this.settings.port} · token: ${this.settings.token}`) });
   }
 
-  onunload() { if (this.server) this.server.close(); }
+  get root() { return String(this.settings.rootFolder || '').trim().replace(/^\/+|\/+$/g, '') || DEFAULT_ROOT; }
+
+  onunload() { this.stopServer(); }
+
+  /* close() only stops new connections; a browser holding a keep-alive socket
+     keeps the listener bound, so the next load hits EADDRINUSE. Sockets are
+     tracked and destroyed explicitly. */
+  stopServer() {
+    this.sockets?.forEach((socket) => socket.destroy());
+    this.sockets?.clear();
+    if (this.server) { this.server.close(); this.server = null; }
+  }
 
   startServer() {
+    this.stopServer();
     this.server = http.createServer(async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-GedOS-Token'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
@@ -181,13 +209,23 @@ class GedOSVaultBridge extends Plugin {
       /* features lets mmxMatrix refuse to push a payload this bridge would
          misread — an older build would treat a managed-block payload as an
          empty note and wipe the file */
-      if (req.method === 'GET' && route === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, vault: this.app.vault.getName(), features: ['notes', 'managedBlock'] })); }
+      if (req.method === 'GET' && route === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, vault: this.app.vault.getName(), root: this.root, features: ['notes', 'managedBlock', 'configurableRoot'] })); }
       if (req.method === 'GET' && route === '/graph') return this.getGraph(res);
       if (req.method === 'GET' && route === '/notes') return this.getNotes(res, requestUrl.searchParams);
       if (req.method === 'POST' && route === '/trades') return this.receiveTrade(req, res);
       res.writeHead(404); res.end();
     });
-    this.server.on('error', (error) => new Notice(`GedOS bridge başlatılamadı: ${error.message}`));
+    this.sockets = new Set();
+    this.server.on('connection', (socket) => {
+      this.sockets.add(socket);
+      socket.on('close', () => this.sockets.delete(socket));
+    });
+    this.server.on('error', (error) => {
+      const message = error.code === 'EADDRINUSE'
+        ? `Port ${this.settings.port} kullanımda. Obsidian'ı tamamen kapatıp (⌘Q / Alt+F4) yeniden aç, ya da ayarlardan başka bir port seç.`
+        : `GedOS bridge başlatılamadı: ${error.message}`;
+      new Notice(message, 10000);
+    });
     this.server.listen(Number(this.settings.port), '127.0.0.1');
   }
 
@@ -200,7 +238,7 @@ class GedOSVaultBridge extends Plugin {
         /* the graph legend only draws trade / model / journal today, so concept
            notes ride along as journal until the Concept layer lands. Drop this
            line to give them their own node type. */
-        const classified = classifyNote(file, cache, tags);
+        const classified = classifyNote(file, cache, tags, this.root);
         const type = classified === 'concept' ? 'journal' : classified;
         /* mmxMatrix writes trade_id into every trade note's frontmatter; passing
            it through lets the site open the right row without guessing from
@@ -227,7 +265,7 @@ class GedOSVaultBridge extends Plugin {
       for (const file of this.app.vault.getMarkdownFiles()) {
         const cache = this.app.metadataCache.getFileCache(file) || {};
         const tags = noteTags(cache);
-        const type = classifyNote(file, cache, tags);
+        const type = classifyNote(file, cache, tags, this.root);
         if (wanted && !wanted.has(type)) continue;
         notes.push({ id: file.path, name: file.basename, path: file.path, folder: file.parent?.path || '', type, tags: tags.slice(0, 12), aliases: noteAliases(cache) });
         if (notes.length >= 1000) break;
@@ -242,8 +280,8 @@ class GedOSVaultBridge extends Plugin {
     let raw = ''; req.on('data', (chunk) => { raw += chunk; if (raw.length > 12_000_000) req.destroy(); });
     req.on('end', async () => {
       try {
-        const payload = JSON.parse(raw); const trade = payload.trade || {}; const date = new Date(trade.tradeDate || Date.now()); const year = String(date.getFullYear()); const month = String(date.getMonth() + 1).padStart(2, '0'); const symbol = safePart(trade.symbol, 'TRADE'); const id = safePart(trade.id, Date.now()); const folder = `GedOS/Trading Journal/${year}/${month}`; const attachmentFolder = `${folder}/attachments`;
-        for (const path of ['GedOS', 'GedOS/Trading Journal', `GedOS/Trading Journal/${year}`, folder, attachmentFolder]) await this.app.vault.createFolder(path).catch(() => {});
+        const payload = JSON.parse(raw); const trade = payload.trade || {}; const date = new Date(trade.tradeDate || Date.now()); const year = String(date.getFullYear()); const month = String(date.getMonth() + 1).padStart(2, '0'); const symbol = safePart(trade.symbol, 'TRADE'); const id = safePart(trade.id, Date.now()); const journal = joinPath(this.root, 'Trading Journal'); const folder = `${journal}/${year}/${month}`; const attachmentFolder = `${folder}/attachments`;
+        for (const path of [this.root, journal, `${journal}/${year}`, folder, attachmentFolder]) await this.app.vault.createFolder(path).catch(() => {});
         const attachments = payload.attachments || {}; const links = {};
         for (const [key, item] of Object.entries(attachments)) { if (!item?.dataUrl) continue; const comma = item.dataUrl.indexOf(','); const bytes = Buffer.from(comma >= 0 ? item.dataUrl.slice(comma + 1) : item.dataUrl, 'base64'); const fileName = safePart(item.fileName, `${key}.png`); const path = `${attachmentFolder}/${id}-${fileName}`; await this.app.vault.adapter.writeBinary(path, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)); links[key] = `${id}-${fileName}`; }
         if (typeof payload.body !== 'string') { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'Payload has no managed body. Update mmxMatrix — writing the whole note would overwrite your own content.' })); }
@@ -291,13 +329,14 @@ class GedOSVaultBridge extends Plugin {
   }
 
   async ensureHubNotes(hubs) {
+    const root = this.root;
     const existingBasenames = new Set(this.app.vault.getMarkdownFiles().map((file) => file.basename.toLowerCase()));
     for (const hub of Array.isArray(hubs) ? hubs : []) {
       const folder = safePart(hub?.folder, 'Concepts');
       const name = safeNoteName(hub?.name, '');
       if (!name) continue;
       if (existingBasenames.has(name.toLowerCase())) continue;
-      const dir = `GedOS/Trading Journal/${folder}`;
+      const dir = joinPath(this.root, 'Trading Journal', folder);
       await this.app.vault.createFolder(dir).catch(() => {});
       const path = `${dir}/${name}.md`;
       if (await this.app.vault.adapter.exists(path)) continue;
@@ -316,6 +355,13 @@ class GedOSSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('Port').setDesc('Varsayılan: 27125').addText((text) => {
       text.setValue(String(this.plugin.settings.port)).onChange(async (value) => {
         this.plugin.settings.port = Number(value) || 27125;
+        await this.plugin.saveData(this.plugin.settings);
+      });
+    });
+    new Setting(containerEl).setName('Vault klasörü').setDesc('mmxMatrix notlarının yazılacağı kök klasör. Boş bırakırsan mmxMatrix kullanılır.').addText((text) => {
+      text.setPlaceholder('mmxMatrix').setValue(this.plugin.settings.rootFolder || '').onChange(async (value) => {
+        /* trailing slashes and stray spaces would create odd folder names */
+        this.plugin.settings.rootFolder = String(value).trim().replace(/^\/+|\/+$/g, '');
         await this.plugin.saveData(this.plugin.settings);
       });
     });
